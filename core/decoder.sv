@@ -554,6 +554,18 @@ module decoder
           endcase
         end
 
+        // PIM fences: pim.fence.{cl,inv,flush} reuse the Zicbom CBO path
+        riscv::OpcodeCustom0: begin
+          instruction_o.fu       = STORE;            // send it to the store unit
+          instruction_o.rs1[4:0] = instr.itype.rs1;  // address comes from rs1
+          case (instr.stype.funct3)
+            3'b001:  instruction_o.op = ariane_pkg::CBO_CLEAN;
+            3'b010:  instruction_o.op = ariane_pkg::CBO_INVAL;
+            3'b100:  instruction_o.op = ariane_pkg::CBO_FLUSH;
+            default: illegal_instr = 1'b1;           // wait/dispatch/gemv come later
+          endcase
+        end
+
         // --------------------------
         // Reg-Reg Operations
         // --------------------------

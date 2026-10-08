@@ -372,26 +372,66 @@ module ariane_testharness #(
   );
 
   // ------------------------------
-  // GPIO
+  // GPIO slot -> PIM stub (testbench only)
   // ------------------------------
 
-  // GPIO not implemented, adding an error slave here
+  // Stands in for the PIM device: reads and writes DRAM (i_sram) directly, past the CPU caches.
+  // 64-bit registers at GPIOBase, 64-bit accesses only:
+  //   0x00 PIM_ADDR   RW  DRAM address the stub acts on
+  //   0x08 PIM_READ   W: doorbell, stub reads DRAM[PIM_ADDR] now   R: the value it read
+  //   0x18 PIM_WRITE  W: stub writes the value into DRAM[PIM_ADDR]
+  logic                         pim_req, pim_we;
+  logic [AXI_ADDRESS_WIDTH-1:0] pim_addr;
+  logic [AXI_DATA_WIDTH-1:0]    pim_wdata, pim_rdata;
+  logic [AXI_DATA_WIDTH/8-1:0]  pim_be;
+  logic [AXI_USER_WIDTH-1:0]    pim_wuser;
+  logic [63:0]                  pim_target_q, pim_seen_q;
+  logic [$clog2(NUM_WORDS)-1:0] pim_word;
 
-  ariane_axi_soc::req_slv_t  gpio_req;
-  ariane_axi_soc::resp_slv_t gpio_resp;
-  `AXI_ASSIGN_TO_REQ(gpio_req, master[ariane_soc::GPIO])
-  `AXI_ASSIGN_FROM_RESP(master[ariane_soc::GPIO], gpio_resp)
-  axi_err_slv #(
-    .AxiIdWidth ( ariane_axi_soc::IdWidthSlave ),
-    .req_t      ( ariane_axi_soc::req_slv_t    ),
-    .resp_t     ( ariane_axi_soc::resp_slv_t   )
-  ) i_gpio_err_slv (
-    .clk_i      ( clk_i      ),
-    .rst_ni     ( ndmreset_n ),
-    .test_i     ( test_en    ),
-    .slv_req_i  ( gpio_req ),
-    .slv_resp_o ( gpio_resp )
+  axi2mem #(
+    .AXI_ID_WIDTH   ( ariane_axi_soc::IdWidthSlave ),
+    .AXI_ADDR_WIDTH ( AXI_ADDRESS_WIDTH            ),
+    .AXI_DATA_WIDTH ( AXI_DATA_WIDTH               ),
+    .AXI_USER_WIDTH ( AXI_USER_WIDTH               )
+  ) i_pim_stub_axi2mem (
+    .clk_i  ( clk_i                    ),
+    .rst_ni ( ndmreset_n               ),
+    .slave  ( master[ariane_soc::GPIO] ),
+    .req_o  ( pim_req                  ),
+    .we_o   ( pim_we                   ),
+    .addr_o ( pim_addr                 ),
+    .be_o   ( pim_be                   ),
+    .user_o ( pim_wuser                ),
+    .data_o ( pim_wdata                ),
+    .user_i ( '0                       ),
+    .data_i ( pim_rdata                )
   );
+
+  // same word mapping as i_sram
+  assign pim_word = pim_target_q[$clog2(NUM_WORDS)-1+$clog2(AXI_DATA_WIDTH/8):$clog2(AXI_DATA_WIDTH/8)];
+
+  always_ff @(posedge clk_i or negedge ndmreset_n) begin
+    if (!ndmreset_n) begin
+      pim_target_q <= '0;
+      pim_seen_q   <= '0;
+      pim_rdata    <= '0;
+    end else if (pim_req) begin
+      if (pim_we) begin
+        case (pim_addr[4:3])
+          2'd0: pim_target_q <= pim_wdata;
+          2'd1: pim_seen_q <= i_sram.gen_cut[0].i_tc_sram_wrapper.i_tc_sram.sram[pim_word];  // doorbell: read DRAM
+          2'd3: i_sram.gen_cut[0].i_tc_sram_wrapper.i_tc_sram.sram[pim_word] <= pim_wdata;  // write DRAM
+          default: ;
+        endcase
+      end else begin
+        case (pim_addr[4:3])
+          2'd0:    pim_rdata <= pim_target_q;
+          2'd1:    pim_rdata <= pim_seen_q;
+          default: pim_rdata <= '0;
+        endcase
+      end
+    end
+  end
 
 
   // ------------------------------
