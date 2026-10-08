@@ -231,6 +231,13 @@ module store_buffer
   // drain if the load VA matches any store VA modulo the page size (i.e.
   // bits 11:0).  As a special case, it is correct to bypass if the full VA
   // matches, and no younger stores' VAs match in bits 11:0.
+  // a CBO acts on its whole cache line, a store only on its own 8 bytes (RISC-V CMO ordering rule)
+  localparam int unsigned LineLsb = CVA6Cfg.DCACHE_OFFSET_WIDTH;
+  function automatic logic offset_matches(logic [11:0] load_off, logic [11:0] entry_off, cbo_t cbo_op);
+    if (cbo_op != ariane_pkg::CBO_NONE) return load_off[11:LineLsb] == entry_off[11:LineLsb];
+    return load_off[11:3] == entry_off[11:3];
+  endfunction
+
   //
   // checks if the requested load is in the store buffer
   // page offsets are virtually and physically the same
@@ -240,7 +247,8 @@ module store_buffer
     // check if the LSBs are identical and the entry is valid
     for (int unsigned i = 0; i < DEPTH_COMMIT; i++) begin
       // Check if the page offset matches and whether the entry is valid, for the commit queue
-      if ((page_offset_i[11:3] == commit_queue_q[i].address[11:3]) && commit_queue_q[i].valid) begin
+      if (offset_matches(page_offset_i, commit_queue_q[i].address[11:0], commit_queue_q[i].cbo_op) &&
+          commit_queue_q[i].valid) begin
         page_offset_matches_o = 1'b1;
         break;
       end
@@ -248,13 +256,14 @@ module store_buffer
 
     for (int unsigned i = 0; i < DEPTH_SPEC; i++) begin
       // do the same for the speculative queue
-      if ((page_offset_i[11:3] == speculative_queue_q[i].address[11:3]) && speculative_queue_q[i].valid) begin
+      if (offset_matches(page_offset_i, speculative_queue_q[i].address[11:0], speculative_queue_q[i].cbo_op) &&
+          speculative_queue_q[i].valid) begin
         page_offset_matches_o = 1'b1;
         break;
       end
     end
     // or it matches with the entry we are currently putting into the queue
-    if ((page_offset_i[11:3] == paddr_i[11:3]) && valid_without_flush_i) begin
+    if (offset_matches(page_offset_i, paddr_i[11:0], cbo_op_i) && valid_without_flush_i) begin
       page_offset_matches_o = 1'b1;
     end
   end
