@@ -380,6 +380,13 @@ module ariane_testharness #(
   //   0x00 PIM_ADDR   RW  DRAM address the stub acts on
   //   0x08 PIM_READ   W: doorbell, stub reads DRAM[PIM_ADDR] now   R: the value it read
   //   0x18 PIM_WRITE  W: stub writes the value into DRAM[PIM_ADDR]
+  // PIM port: the core sends each pim.dispatch / pim.gemv as two writes (ariane_pkg::PIM_PORT_*)
+  //   0x20 CMD_PA       W  operand physical address (translated rs1)
+  //   0x28 CMD_DISPATCH W  descriptor of a pim.dispatch: logs {kind 1, CMD_PA, descriptor}
+  //   0x30 CMD_GEMV     W  descriptor of a pim.gemv:     logs {kind 2, CMD_PA, descriptor}
+  //   0x38 CMD_COUNT    R  commands received
+  //   0x40 LOG_SEL      W  log entry to read back (16 entries, entry = command number mod 16)
+  //   0x48 LOG_KIND, 0x50 LOG_PA, 0x58 LOG_DESC   R  fields of the selected entry
   logic                         pim_req, pim_we;
   logic [AXI_ADDRESS_WIDTH-1:0] pim_addr;
   logic [AXI_DATA_WIDTH-1:0]    pim_wdata, pim_rdata;
@@ -387,6 +394,11 @@ module ariane_testharness #(
   logic [AXI_USER_WIDTH-1:0]    pim_wuser;
   logic [63:0]                  pim_target_q, pim_seen_q;
   logic [$clog2(NUM_WORDS)-1:0] pim_word;
+  logic [63:0]                  pim_cmd_pa_q, pim_cmd_cnt_q;
+  logic [3:0]                   pim_log_sel_q;
+  logic [1:0]                   pim_log_kind_q [16];
+  logic [63:0]                  pim_log_pa_q   [16];
+  logic [63:0]                  pim_log_desc_q [16];
 
   axi2mem #(
     .AXI_ID_WIDTH   ( ariane_axi_soc::IdWidthSlave ),
@@ -412,21 +424,37 @@ module ariane_testharness #(
 
   always_ff @(posedge clk_i or negedge ndmreset_n) begin
     if (!ndmreset_n) begin
-      pim_target_q <= '0;
-      pim_seen_q   <= '0;
-      pim_rdata    <= '0;
+      pim_target_q  <= '0;
+      pim_seen_q    <= '0;
+      pim_rdata     <= '0;
+      pim_cmd_pa_q  <= '0;
+      pim_cmd_cnt_q <= '0;
+      pim_log_sel_q <= '0;
     end else if (pim_req) begin
       if (pim_we) begin
-        case (pim_addr[4:3])
-          2'd0: pim_target_q <= pim_wdata;
-          2'd1: pim_seen_q <= i_sram.gen_cut[0].i_tc_sram_wrapper.i_tc_sram.sram[pim_word];  // doorbell: read DRAM
-          2'd3: i_sram.gen_cut[0].i_tc_sram_wrapper.i_tc_sram.sram[pim_word] <= pim_wdata;  // write DRAM
+        case (pim_addr[7:3])
+          5'd0: pim_target_q <= pim_wdata;
+          5'd1: pim_seen_q <= i_sram.gen_cut[0].i_tc_sram_wrapper.i_tc_sram.sram[pim_word];  // doorbell: read DRAM
+          5'd3: i_sram.gen_cut[0].i_tc_sram_wrapper.i_tc_sram.sram[pim_word] <= pim_wdata;  // write DRAM
+          5'd4: pim_cmd_pa_q <= pim_wdata;
+          5'd5, 5'd6: begin  // command doorbells
+            pim_log_kind_q[pim_cmd_cnt_q[3:0]] <= (pim_addr[7:3] == 5'd6) ? 2'd2 : 2'd1;
+            pim_log_pa_q[pim_cmd_cnt_q[3:0]]   <= pim_cmd_pa_q;
+            pim_log_desc_q[pim_cmd_cnt_q[3:0]] <= pim_wdata;
+            pim_cmd_cnt_q <= pim_cmd_cnt_q + 1;
+          end
+          5'd8: pim_log_sel_q <= pim_wdata[3:0];
           default: ;
         endcase
       end else begin
-        case (pim_addr[4:3])
-          2'd0:    pim_rdata <= pim_target_q;
-          2'd1:    pim_rdata <= pim_seen_q;
+        case (pim_addr[7:3])
+          5'd0:    pim_rdata <= pim_target_q;
+          5'd1:    pim_rdata <= pim_seen_q;
+          5'd4:    pim_rdata <= pim_cmd_pa_q;
+          5'd7:    pim_rdata <= pim_cmd_cnt_q;
+          5'd9:    pim_rdata <= 64'(pim_log_kind_q[pim_log_sel_q]);
+          5'd10:   pim_rdata <= pim_log_pa_q[pim_log_sel_q];
+          5'd11:   pim_rdata <= pim_log_desc_q[pim_log_sel_q];
           default: pim_rdata <= '0;
         endcase
       end

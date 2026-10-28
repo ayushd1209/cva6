@@ -42,6 +42,16 @@ package ariane_pkg;
   // allocate more space for the commit buffer to be on the safe side, this needs to be a power of two
   localparam logic [2:0] DEPTH_COMMIT = 'd4;
 
+  // PIM offload: command kind of a store-buffer entry, token pool size, PIM port of the device
+  localparam logic [1:0] PIM_K_NONE = 2'd0;
+  localparam logic [1:0] PIM_K_DISPATCH = 2'd1;
+  localparam logic [1:0] PIM_K_GEMV = 2'd2;
+  localparam int unsigned PIM_TOKENS = 64;
+  // a command leaves as two uncached writes: operand address, then descriptor to the kind's doorbell
+  localparam logic [63:0] PIM_PORT_ADDR = 64'h4000_0020;
+  localparam logic [63:0] PIM_PORT_DISPATCH = 64'h4000_0028;
+  localparam logic [63:0] PIM_PORT_GEMV = 64'h4000_0030;
+
   // Transprecision float unit
   localparam int unsigned LAT_COMP_FP32 = 'd2;
   localparam int unsigned LAT_COMP_FP64 = 'd3;
@@ -537,7 +547,12 @@ package ariane_pkg;
     SHA512SIG0,
     SHA512SIG1,
     SHA512SUM0,
-    SHA512SUM1
+    SHA512SUM1,
+    // PIM offload (custom-0): commands go through the store unit, the wait through the CSR unit
+    PIM_DISPATCH,    // pim.dispatch, completion bit (25) clear
+    PIM_DISPATCH_C,  // pim.dispatch, completion bit set: gets a token
+    PIM_GEMV,
+    PIM_WAIT
   } fu_op;
 
   typedef struct packed {

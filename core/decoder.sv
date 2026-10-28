@@ -555,6 +555,7 @@ module decoder
         end
 
         // PIM fences: pim.fence.{cl,inv,flush} reuse the Zicbom CBO path
+        // pim.dispatch / pim.gemv rd, rs1, rs2: store-unit commands, token to rd
         riscv::OpcodeCustom0: begin
           instruction_o.fu       = STORE;            // send it to the store unit
           instruction_o.rs1[4:0] = instr.itype.rs1;  // address comes from rs1
@@ -562,7 +563,14 @@ module decoder
             3'b001:  instruction_o.op = ariane_pkg::CBO_CLEAN;
             3'b010:  instruction_o.op = ariane_pkg::CBO_INVAL;
             3'b100:  instruction_o.op = ariane_pkg::CBO_FLUSH;
-            default: illegal_instr = 1'b1;           // wait/dispatch/gemv come later
+            3'b011, 3'b101: begin
+              if (instr.stype.funct3 == 3'b101) instruction_o.op = ariane_pkg::PIM_GEMV;
+              else if (instr.instr[25]) instruction_o.op = ariane_pkg::PIM_DISPATCH_C;  // completion bit
+              else instruction_o.op = ariane_pkg::PIM_DISPATCH;
+              instruction_o.rs2[4:0] = instr.rtype.rs2;  // payload
+              instruction_o.rd[4:0]  = instr.rtype.rd;   // token
+            end
+            default: illegal_instr = 1'b1;           // pim.wait comes later
           endcase
         end
 

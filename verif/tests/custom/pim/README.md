@@ -53,6 +53,31 @@ have to.
 last four. Each run leaves `<test>.log` and `<test>.dasm` in `work-pim/`; the
 `.dasm` file is the retired-instruction trace.
 
+## Is the bug CVA6's own?
+
+Yes. On the core without the store-buffer fix, the standard Zicbom
+`cbo.inval` (0x0005200f) reads the same stale copy as `pim.fence.inv`
+(`pim_cbo_inval.c`, a copy of `pim_fence_inv.c` with the standard instruction).
+In M-mode the decoder turns both into the same CBO_INVAL store-unit operation,
+so the custom decode adds nothing to the bug.
+
+| Test (core without the fix) | Expected | Got (2026-10-28) |
+|---|---|---|
+| `nofix_cbo_inval` | FAIL, tohost = 1 | FAIL, tohost = 1: `ld 8(a0)` returns 0x0202… after `cbo.inval` |
+| `nofix_cbo_inval_same` | PASS (control: same 8-byte word) | PASS |
+| `nofix_fence_inv` | FAIL, tohost = 1 (the 10-08 result) | FAIL, tohost = 1 |
+
+Build the core without the fix into its own directory, restore the fix, run:
+
+```sh
+git show f7e3c457f:core/store_buffer.sv > core/store_buffer.sv
+make verilate verilator="verilator --no-timing" target=cv64a6_imafdc_sv39_hpdcache_wb NUM_JOBS=8 ver-library=work-ver-nofix
+git checkout HEAD -- core/store_buffer.sv
+bash verif/tests/custom/pim/run_cbo_check.sh work-ver-nofix
+```
+
+(inside the container, with `RISCV`, `VERILATOR_INSTALL_DIR` and `PATH` set as in `run_fence_tests.sh`).
+
 ## Commits (branch `pim-ext`)
 
 | Commit | Content | Result |

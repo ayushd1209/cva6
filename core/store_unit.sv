@@ -119,8 +119,10 @@ module store_unit
     return data_tmp[CVA6Cfg.XLEN-1:0];
   endfunction
 
-  // it doesn't matter what we are writing back as stores don't return anything
-  assign result_o = lsu_ctrl_i.data;
+  // stores don't return anything; a PIM command returns its token
+  logic pim_tok_q;
+  logic [$clog2(PIM_TOKENS)-1:0] tok_next;
+  assign result_o = pim_tok_q ? CVA6Cfg.XLEN'(tok_next) : lsu_ctrl_i.data;
 
   enum logic [1:0] {
     IDLE,
@@ -142,6 +144,9 @@ module store_unit
   logic [1:0] st_data_size_n, st_data_size_q;
   amo_t amo_op_d, amo_op_q;
   cbo_t cbo_op_d, cbo_op_q;
+  // PIM command: kind, needs a token, completion bit
+  logic [1:0] pim_kind_d, pim_kind_q;
+  logic pim_tok_d, pim_comp_d, pim_comp_q;
 
   logic [CVA6Cfg.TRANS_ID_BITS-1:0] trans_id_n, trans_id_q;
 
@@ -295,6 +300,7 @@ module store_unit
     // don't shift the data if we are going to perform an AMO as we still need to operate on this data
     st_data_n = ((CVA6Cfg.RVA && instr_is_amo) ? endian_data[CVA6Cfg.XLEN-1:0] :
                  data_align(lsu_ctrl_i.vaddr[2:0], {{64 - CVA6Cfg.XLEN{1'b0}}, endian_data}));
+    if (pim_kind_d != PIM_K_NONE) st_data_n = lsu_ctrl_i.data;  // rs2, not memory data
     st_data_size_n = extract_transfer_size(lsu_ctrl_i.operation);
     // save AMO op for next cycle
     if (CVA6Cfg.RVA) begin
@@ -328,6 +334,69 @@ module store_unit
     end
   end
 
+  always_comb begin : pim_decode
+    pim_kind_d = PIM_K_NONE;
+    pim_tok_d  = 1'b0;
+    pim_comp_d = 1'b0;
+    case (lsu_ctrl_i.operation)
+      PIM_DISPATCH: pim_kind_d = PIM_K_DISPATCH;
+      PIM_DISPATCH_C: begin
+        pim_kind_d = PIM_K_DISPATCH;
+        pim_tok_d  = 1'b1;
+        pim_comp_d = 1'b1;
+      end
+      PIM_GEMV: begin
+        pim_kind_d = PIM_K_GEMV;
+        pim_tok_d  = 1'b1;
+      end
+      default: ;
+    endcase
+  end
+
+  // ---------------
+  // PIM Token Pool
+  // ---------------
+  // 64 slots, round-robin over the free ones, taken when the command enters the store buffer.
+  // A token whose command is flushed before commit is not returned.
+  localparam int unsigned TokW = $clog2(PIM_TOKENS);
+  logic [PIM_TOKENS-1:0] tok_busy_d, tok_busy_q, tok_free_after;
+  logic [TokW-1:0] tok_rr_d, tok_rr_q;
+  logic tok_found, tok_alloc, tok_avail;
+
+  always_comb begin : tok_search
+    tok_found = 1'b0;
+    tok_next  = '0;
+    for (int unsigned i = 0; i < PIM_TOKENS; i++) begin
+      if (!tok_found && !tok_busy_q[TokW'(tok_rr_q+i)]) begin
+        tok_found = 1'b1;
+        tok_next  = TokW'(tok_rr_q + i);
+      end
+    end
+  end
+
+  assign tok_alloc = st_valid && pim_tok_q;
+  assign tok_free_after = ~tok_busy_q & ~({{PIM_TOKENS - 1{1'b0}}, tok_alloc} << tok_next);
+  assign tok_avail = |tok_free_after;  // a slot is left for the next command
+
+  always_comb begin : tok_update
+    tok_busy_d = tok_busy_q;
+    tok_rr_d   = tok_rr_q;
+    if (tok_alloc) begin
+      tok_busy_d[tok_next] = 1'b1;
+      tok_rr_d = tok_next + 1'b1;
+    end
+  end
+
+  // descriptor, laid out as in the gem5 model: token[63:48] | asid[47:32] (0: no ASID in RTL) | payload[31:0]
+  // payload: pim.dispatch = completion[31] | num_macs[30:0], pim.gemv = num_outputs[31:16] | dot_steps[15:0]
+  logic [CVA6Cfg.XLEN-1:0] sb_data;
+  always_comb begin : pim_descriptor
+    sb_data = st_data_q;
+    if (pim_kind_q == PIM_K_DISPATCH)
+      sb_data = {16'(pim_comp_q ? tok_next : '0), 16'b0, pim_comp_q, st_data_q[30:0]};
+    else if (pim_kind_q == PIM_K_GEMV) sb_data = {16'(tok_next), 16'b0, st_data_q[31:0]};
+  end
+
   logic store_buffer_valid, amo_buffer_valid;
   logic store_buffer_ready, amo_buffer_ready;
 
@@ -335,7 +404,8 @@ module store_unit
   assign store_buffer_valid = st_valid & (!CVA6Cfg.RVA || (amo_op_q == AMO_NONE));
   assign amo_buffer_valid = st_valid & (CVA6Cfg.RVA && (amo_op_q != AMO_NONE));
 
-  assign st_ready = store_buffer_ready & amo_buffer_ready;
+  // a PIM command that needs a token waits for a free one
+  assign st_ready = store_buffer_ready & amo_buffer_ready & (tok_avail | !pim_tok_d);
 
   // ---------------
   // Store Queue
@@ -366,8 +436,9 @@ module store_unit
       .valid_without_flush_i(st_valid_without_flush),
       .paddr_i,
       .rvfi_mem_paddr_o     (rvfi_mem_paddr_o),
-      .data_i               (st_data_q),
+      .data_i               (sb_data),
       .cbo_op_i             (cbo_op_q),
+      .pim_kind_i           (pim_kind_q),
       .be_i                 (st_be_q),
       .data_size_i          (st_data_size_q),
       .req_port_i           (req_port_i),
@@ -409,6 +480,11 @@ module store_unit
       trans_id_q     <= '0;
       amo_op_q       <= AMO_NONE;
       cbo_op_q       <= ariane_pkg::CBO_NONE;
+      pim_kind_q     <= PIM_K_NONE;
+      pim_tok_q      <= 1'b0;
+      pim_comp_q     <= 1'b0;
+      tok_busy_q     <= '0;
+      tok_rr_q       <= '0;
     end else begin
       state_q        <= state_d;
       st_be_q        <= st_be_n;
@@ -417,6 +493,11 @@ module store_unit
       st_data_size_q <= st_data_size_n;
       amo_op_q       <= amo_op_d;
       cbo_op_q       <= cbo_op_d;
+      pim_kind_q     <= pim_kind_d;
+      pim_tok_q      <= pim_tok_d;
+      pim_comp_q     <= pim_comp_d;
+      tok_busy_q     <= tok_busy_d;
+      tok_rr_q       <= tok_rr_d;
     end
   end
 

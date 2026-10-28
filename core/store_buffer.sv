@@ -47,6 +47,7 @@ module store_buffer
     input logic [(CVA6Cfg.XLEN/8)-1:0] be_i,  // byte enable in
     input logic [1:0] data_size_i,  // type of request we are making (e.g.: bytes to write)
     input cbo_t cbo_op_i,  // type of cache block operation
+    input logic [1:0] pim_kind_i,  // PIM command kind (PIM_K_*), address = operand, data = descriptor
 
     // D$ interface
     input  dcache_req_o_t req_port_i,
@@ -62,6 +63,7 @@ module store_buffer
     logic [(CVA6Cfg.XLEN/8)-1:0] be;
     logic [1:0] data_size;
     cbo_t cbo_op;
+    logic [1:0] pim_kind;
     logic valid;  // this entry is valid, we need this for checking if the address offset matches
     logic wait_rvalid;  // need to wait for rvalid...
   }
@@ -101,6 +103,7 @@ module store_buffer
       speculative_queue_n[speculative_write_pointer_q].data_size = data_size_i;
       speculative_queue_n[speculative_write_pointer_q].valid = 1'b1;
       speculative_queue_n[speculative_write_pointer_q].cbo_op = cbo_op_i;
+      speculative_queue_n[speculative_write_pointer_q].pim_kind = pim_kind_i;
       speculative_queue_n[speculative_write_pointer_q].wait_rvalid = 1'b0;
       // advance the write pointer
       speculative_write_pointer_n = speculative_write_pointer_q + 1'b1;
@@ -145,16 +148,39 @@ module store_buffer
 
   // we do not require an acknowledgement for writes, thus we do not need to identify uniquely the responses
   assign req_port_o.data_id = '0;
+  // a PIM entry leaves as two uncached writes: operand address to PIM_PORT_ADDR (half 0),
+  // then the descriptor to the kind's doorbell (half 1)
+  logic pim_half_d, pim_half_q;
+  logic [CVA6Cfg.PLEN-1:0] req_addr;
+  logic [CVA6Cfg.XLEN-1:0] req_wdata;
+  logic [(CVA6Cfg.XLEN/8)-1:0] req_be;
+  logic [1:0] req_size;
+  always_comb begin : pim_port
+    req_addr  = commit_queue_q[commit_read_pointer_q].address;
+    req_wdata = commit_queue_q[commit_read_pointer_q].data;
+    req_be    = commit_queue_q[commit_read_pointer_q].be;
+    req_size  = commit_queue_q[commit_read_pointer_q].data_size;
+    if (commit_queue_q[commit_read_pointer_q].pim_kind != PIM_K_NONE) begin
+      req_be   = '1;
+      req_size = 2'b11;
+      if (!pim_half_q) begin
+        req_addr  = CVA6Cfg.PLEN'(PIM_PORT_ADDR);
+        req_wdata = CVA6Cfg.XLEN'(commit_queue_q[commit_read_pointer_q].address);
+      end else begin
+        req_addr = CVA6Cfg.PLEN'((commit_queue_q[commit_read_pointer_q].pim_kind == PIM_K_GEMV) ?
+                                 PIM_PORT_GEMV : PIM_PORT_DISPATCH);
+      end
+    end
+  end
   // those signals can directly be output to the memory
-  assign req_port_o.address_index = commit_queue_q[commit_read_pointer_q].address[CVA6Cfg.DCACHE_INDEX_WIDTH-1:0];
+  assign req_port_o.address_index = req_addr[CVA6Cfg.DCACHE_INDEX_WIDTH-1:0];
   // if we got a new request we already saved the tag from the previous cycle
-  assign req_port_o.address_tag   = commit_queue_q[commit_read_pointer_q].address[CVA6Cfg.DCACHE_TAG_WIDTH     +
-                                                                                    CVA6Cfg.DCACHE_INDEX_WIDTH-1 :
-                                                                                    CVA6Cfg.DCACHE_INDEX_WIDTH];
-  assign req_port_o.data_wdata = commit_queue_q[commit_read_pointer_q].data;
+  assign req_port_o.address_tag   = req_addr[CVA6Cfg.DCACHE_TAG_WIDTH+CVA6Cfg.DCACHE_INDEX_WIDTH-1 :
+                                             CVA6Cfg.DCACHE_INDEX_WIDTH];
+  assign req_port_o.data_wdata = req_wdata;
   assign req_port_o.data_wuser = '0;
-  assign req_port_o.data_be = commit_queue_q[commit_read_pointer_q].be;
-  assign req_port_o.data_size = commit_queue_q[commit_read_pointer_q].data_size;
+  assign req_port_o.data_be = req_be;
+  assign req_port_o.data_size = req_size;
 
   assign rvfi_mem_paddr_o = speculative_queue_q[speculative_read_pointer_q].address;
 
@@ -173,12 +199,17 @@ module store_buffer
 
     req_port_o.data_req    = 1'b0;
     req_port_o.cbo_op      = commit_queue_q[commit_read_pointer_q].cbo_op;
+    pim_half_d             = pim_half_q;
 
     // there should be no commit when we are flushing
     // if the entry in the commit queue is valid and not speculative anymore we can issue this instruction
     if (commit_queue_q[commit_read_pointer_q].valid && !stall_st_pending_i && !commit_queue_q[commit_read_pointer_q].wait_rvalid) begin
       req_port_o.data_req = 1'b1;
-      if (req_port_i.data_gnt) begin
+      if (req_port_i.data_gnt && commit_queue_q[commit_read_pointer_q].pim_kind != PIM_K_NONE && !pim_half_q) begin
+        // first half of a PIM command sent, the entry stays for the doorbell write
+        pim_half_d = 1'b1;
+      end else if (req_port_i.data_gnt) begin
+        pim_half_d = 1'b0;
         if (commit_queue_q[commit_read_pointer_q].cbo_op == ariane_pkg::CBO_NONE || req_port_i.data_rvalid) begin
           // not CBO or rvalid as well -> we can evict it from the commit buffer
           // check for rvalid is technically superfluous, as CBO latency is >= 1 cycle, but check it anyway just to be safe
@@ -232,8 +263,11 @@ module store_buffer
   // bits 11:0).  As a special case, it is correct to bypass if the full VA
   // matches, and no younger stores' VAs match in bits 11:0.
   // a CBO acts on its whole cache line, a store only on its own 8 bytes (RISC-V CMO ordering rule)
+  // a PIM command matches every load: no load passes it before it has left
   localparam int unsigned LineLsb = CVA6Cfg.DCACHE_OFFSET_WIDTH;
-  function automatic logic offset_matches(logic [11:0] load_off, logic [11:0] entry_off, cbo_t cbo_op);
+  function automatic logic offset_matches(logic [11:0] load_off, logic [11:0] entry_off, cbo_t cbo_op,
+                                          logic [1:0] pim_kind);
+    if (pim_kind != PIM_K_NONE) return 1'b1;
     if (cbo_op != ariane_pkg::CBO_NONE) return load_off[11:LineLsb] == entry_off[11:LineLsb];
     return load_off[11:3] == entry_off[11:3];
   endfunction
@@ -247,7 +281,8 @@ module store_buffer
     // check if the LSBs are identical and the entry is valid
     for (int unsigned i = 0; i < DEPTH_COMMIT; i++) begin
       // Check if the page offset matches and whether the entry is valid, for the commit queue
-      if (offset_matches(page_offset_i, commit_queue_q[i].address[11:0], commit_queue_q[i].cbo_op) &&
+      if (offset_matches(page_offset_i, commit_queue_q[i].address[11:0], commit_queue_q[i].cbo_op,
+                         commit_queue_q[i].pim_kind) &&
           commit_queue_q[i].valid) begin
         page_offset_matches_o = 1'b1;
         break;
@@ -256,14 +291,15 @@ module store_buffer
 
     for (int unsigned i = 0; i < DEPTH_SPEC; i++) begin
       // do the same for the speculative queue
-      if (offset_matches(page_offset_i, speculative_queue_q[i].address[11:0], speculative_queue_q[i].cbo_op) &&
+      if (offset_matches(page_offset_i, speculative_queue_q[i].address[11:0], speculative_queue_q[i].cbo_op,
+                         speculative_queue_q[i].pim_kind) &&
           speculative_queue_q[i].valid) begin
         page_offset_matches_o = 1'b1;
         break;
       end
     end
     // or it matches with the entry we are currently putting into the queue
-    if (offset_matches(page_offset_i, paddr_i[11:0], cbo_op_i) && valid_without_flush_i) begin
+    if (offset_matches(page_offset_i, paddr_i[11:0], cbo_op_i, pim_kind_i) && valid_without_flush_i) begin
       page_offset_matches_o = 1'b1;
     end
   end
@@ -291,11 +327,13 @@ module store_buffer
       commit_read_pointer_q  <= '0;
       commit_write_pointer_q <= '0;
       commit_status_cnt_q    <= '0;
+      pim_half_q             <= 1'b0;
     end else begin
       commit_queue_q         <= commit_queue_n;
       commit_read_pointer_q  <= commit_read_pointer_n;
       commit_write_pointer_q <= commit_write_pointer_n;
       commit_status_cnt_q    <= commit_status_cnt_n;
+      pim_half_q             <= pim_half_d;
     end
   end
 

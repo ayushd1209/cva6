@@ -224,6 +224,10 @@ module load_store_unit
   logic                    st_hs_ld_st_inst;
   logic                    st_hlvx_inst;
   logic translation_req, cva6_translation_req, acc_translation_req;
+  // a PIM command's rs1 is translated and checked as a read, as in the gem5 model
+  logic st_translation_is_store;
+  assign st_translation_is_store = st_translation_req &&
+      !(lsu_ctrl.operation inside {PIM_DISPATCH, PIM_DISPATCH_C, PIM_GEMV});
   logic translation_valid, cva6_translation_valid;
   logic [CVA6Cfg.VLEN-1:0] mmu_vaddr, cva6_mmu_vaddr, acc_mmu_vaddr;
   logic [CVA6Cfg.PLEN-1:0] mmu_paddr, cva6_mmu_paddr, acc_mmu_paddr, lsu_paddr;
@@ -293,7 +297,7 @@ module load_store_unit
         .lsu_req_i(translation_req),
         .lsu_vaddr_i(mmu_vaddr),
         .lsu_tinst_i(mmu_tinst),
-        .lsu_is_store_i(st_translation_req),
+        .lsu_is_store_i(st_translation_is_store),
         .csr_hs_ld_st_inst_o(csr_hs_ld_st_inst_o),
         .lsu_dtlb_hit_o(dtlb_hit),  // send in the same cycle as the request
         .lsu_dtlb_ppn_o(dtlb_ppn),  // send in the same cycle as the request
@@ -368,7 +372,7 @@ module load_store_unit
           lsu_paddr <= CVA6Cfg.PLEN'(mmu_vaddr);
         end
         pmp_vaddr_q <= mmu_vaddr;
-        pmp_is_store_q <= st_translation_req;
+        pmp_is_store_q <= st_translation_is_store;
         pmp_hlvx_inst_q <= mmu_hlvx_inst;
         pmp_exception <= misaligned_exception;
         pmp_translation_valid <= translation_req;
